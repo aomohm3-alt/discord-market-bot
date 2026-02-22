@@ -1,9 +1,11 @@
 import os
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
+from zoneinfo import ZoneInfo
 
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 
+# ---- Assets ----
 MAG7 = {
     "AAPL.US": "AAPL",
     "MSFT.US": "MSFT",
@@ -15,8 +17,8 @@ MAG7 = {
 }
 
 ETFS = {
-    "VOO.US": "VOO (S&P500)",
-    "QQQ.US": "QQQ (Nasdaq-100)",
+    "VOO.US": "VOO",
+    "QQQ.US": "QQQ",
 }
 
 SMALL_CAPS = {
@@ -38,6 +40,27 @@ SMALL_CAPS = {
 
 CRYPTO_IDS = ["bitcoin", "ethereum"]
 CRYPTO_MAP = {"bitcoin": "BTC", "ethereum": "ETH"}
+
+# ---------- Market schedule ----------
+def us_market_mode_now():
+    """
+    Mon–Fri: MARKET_OPEN only during 09:30–16:00 America/New_York
+    Sat–Sun: WEEKEND_CRYPTO
+    Else: MARKET_CLOSED
+    """
+    now_et = datetime.now(tz=ZoneInfo("America/New_York"))
+    wd = now_et.weekday()  # Mon=0 ... Sun=6
+
+    if wd >= 5:
+        return "WEEKEND_CRYPTO", now_et
+
+    open_t = time(9, 30)
+    close_t = time(16, 0)
+    if open_t <= now_et.time() <= close_t:
+        return "MARKET_OPEN", now_et
+
+    return "MARKET_CLOSED", now_et
+
 
 # ---------- Data ----------
 def stooq_last_bar(symbol: str):
@@ -69,62 +92,127 @@ def fetch_bucket(mapping: dict[str, str]):
     out.sort(key=lambda x: x["chg"], reverse=True)
     return out
 
-# ---------- UI helpers ----------
+
+# ---------- Terminal UI ----------
 def fmt_price(x: float) -> str:
-    # ทำให้ดูเป็นมืออาชีพ: ตัวใหญ่แยก comma, ทศนิยม 2 ตำแหน่ง
     return f"{x:,.2f}"
 
 def fmt_pct(x: float) -> str:
-    sign = "+" if x >= 0 else ""
-    return f"{sign}{x:.2f}%"
+    return f"{x:+.2f}%"
 
-def diff_table(rows: list[tuple[str, float, float]], *, price_fmt=fmt_price) -> str:
+def tag(chg: float) -> str:
+    if chg >= 7:
+        return "[HOT]"
+    if chg >= 4:
+        return "[HEAT]"
+    if chg <= -7:
+        return "[RISK]"
+    if chg <= -4:
+        return "[DRAW]"
+    return ""
+
+def diff_table_rows(rows, price_fmt=fmt_price, with_tag=False):
     """
-    Discord codeblock 'diff' => + (green) - (red)
-    Format: [+/-] TICKER  PRICE  PCT
+    rows: list of dicts with keys label, close, chg
     """
     if not rows:
         return "```diff\n- no data\n```"
 
-    # column widths
-    sym_w = max(4, max(len(r[0]) for r in rows))
-    price_w = max(8, max(len(price_fmt(r[1])) for r in rows))
+    sym_w = max(3, max(len(r["label"]) for r in rows))
+    price_w = max(8, max(len(price_fmt(r["close"])) for r in rows))
     pct_w = 8
 
     lines = ["```diff"]
-    for sym, price, chg in rows:
+    for r in rows:
+        chg = r["chg"]
         sign = "+" if chg >= 0 else "-"
+        extra = f"  {tag(chg)}" if with_tag and tag(chg) else ""
         lines.append(
-            f"{sign} {sym:<{sym_w}}  {price_fmt(price):>{price_w}}  {fmt_pct(chg):>{pct_w}}"
+            f"{sign} {r['label']:<{sym_w}}  {price_fmt(r['close']):>{price_w}}  {fmt_pct(chg):>{pct_w}}{extra}"
         )
     lines.append("```")
     return "\n".join(lines)
 
+def diff_table_tuple(rows, price_fmt=fmt_price):
+    """
+    rows: list of tuples (label, close, chg)
+    """
+    if not rows:
+        return "```diff\n- no data\n```"
+
+    sym_w = max(3, max(len(r[0]) for r in rows))
+    price_w = max(8, max(len(price_fmt(r[1])) for r in rows))
+    pct_w = 8
+
+    lines = ["```diff"]
+    for label, close, chg in rows:
+        sign = "+" if chg >= 0 else "-"
+        lines.append(f"{sign} {label:<{sym_w}}  {price_fmt(close):>{price_w}}  {fmt_pct(chg):>{pct_w}}")
+    lines.append("```")
+    return "\n".join(lines)
+
 def embed_field(name: str, value: str, inline: bool = False) -> dict:
-    # Discord field value limit ~1024 chars; keep safe by truncating
     if len(value) > 1020:
         value = value[:1017] + "..."
     return {"name": name, "value": value, "inline": inline}
-
-def pick_color(market_proxy: list[float]) -> int:
-    # สี premium: เขียวถ้าภาพรวมบวก แดงถ้าลบ เทาถ้าใกล้ศูนย์
-    avg = sum(market_proxy) / max(1, len(market_proxy))
-    if avg > 0.05:
-        return 0x2ECC71  # green
-    if avg < -0.05:
-        return 0xE74C3C  # red
-    return 0x95A5A6      # gray
 
 def post_embeds(embeds: list[dict]):
     payload = {"embeds": embeds}
     r = requests.post(WEBHOOK, json=payload, timeout=20)
     r.raise_for_status()
 
+def pulse(changes):
+    if not changes:
+        return ("NEUTRAL", 0, 0, 0.0)
+    pos = sum(1 for x in changes if x >= 0)
+    neg = len(changes) - pos
+    heat = sum(changes) / len(changes)
+    state = "ON" if heat > 0.05 else ("OFF" if heat < -0.05 else "NEUTRAL")
+    return (state, pos, neg, heat)
+
+
 # ---------- Main ----------
 def main():
-    bkk = timezone(timedelta(hours=7))
-    now_bkk = datetime.now(tz=bkk).strftime("%Y-%m-%d • %H:%M (BKK)")
+    mode, now_et = us_market_mode_now()
 
+    # Market closed on weekdays => do nothing
+    if mode == "MARKET_CLOSED":
+        return
+
+    bkk = timezone(timedelta(hours=7))
+    now_bkk = datetime.now(tz=bkk).strftime("%Y-%m-%d %H:%M (BKK)")
+    now_et_str = now_et.strftime("%Y-%m-%d %H:%M (ET)")
+
+    # Weekend => Crypto only
+    if mode == "WEEKEND_CRYPTO":
+        cg = cg_prices_with_change(CRYPTO_IDS)
+        crypto = []
+        for cid in CRYPTO_IDS:
+            px = float(cg[cid]["usd"])
+            chg = float(cg[cid].get("usd_24h_change", 0.0))
+            crypto.append({"label": CRYPTO_MAP.get(cid, cid).upper(), "close": px, "chg": chg})
+        crypto.sort(key=lambda x: x["chg"], reverse=True)
+
+        crypto_block = diff_table_rows(
+            crypto,
+            price_fmt=lambda v: f"{v:,.0f}",
+            with_tag=True
+        )
+
+        embed = {
+            "title": "Market Bot — CRYPTO WEEKEND FEED",
+            "description": f"`{now_bkk}`  •  `{now_et_str}`  •  `Weekend Mode`",
+            "color": 0x0B1220,
+            "fields": [
+                embed_field("CRYPTO (24h)", crypto_block, inline=False),
+            ],
+            "footer": {"text": "Weekend: Crypto only • Stocks/ETF paused"},
+            "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+        }
+        post_embeds([embed])
+        return
+
+    # MARKET_OPEN => Full set
     mag7 = fetch_bucket(MAG7)
     etfs = fetch_bucket(ETFS)
     small = fetch_bucket(SMALL_CAPS)
@@ -132,8 +220,9 @@ def main():
     # XAU
     xau = stooq_last_bar("xauusd")
     xau_chg = pct_change(xau["open"], xau["close"])
+    xau_row = [("XAUUSD", xau["close"], xau_chg)]
 
-    # Crypto
+    # Crypto (still show as macro)
     cg = cg_prices_with_change(CRYPTO_IDS)
     crypto = []
     for cid in CRYPTO_IDS:
@@ -142,60 +231,54 @@ def main():
         crypto.append({"label": CRYPTO_MAP.get(cid, cid).upper(), "close": px, "chg": chg})
     crypto.sort(key=lambda x: x["chg"], reverse=True)
 
-    # Market proxy for color (ใช้ ETF + Mag7 เฉลี่ยเป็น mood ตลาด)
-    proxy = [x["chg"] for x in etfs] + [x["chg"] for x in mag7]
-    color = pick_color(proxy)
+    # Pulse from ETF + MAG7
+    core_changes = [x["chg"] for x in etfs] + [x["chg"] for x in mag7]
+    risk, pos, neg, heat = pulse(core_changes)
 
-    # --- Build premium blocks ---
-    mag7_block = diff_table([(x["label"], x["close"], x["chg"]) for x in mag7])
-    etf_block = diff_table([(x["label"], x["close"], x["chg"]) for x in etfs])
-
-    # Small cap: top 5 gainers & top 5 losers
+    # Small cap movers
     top5 = small[:5]
     bot5 = sorted(small[-5:], key=lambda x: x["chg"])  # most negative first
-    gain_block = diff_table([(x["label"], x["close"], x["chg"]) for x in top5])
-    lose_block = diff_table([(x["label"], x["close"], x["chg"]) for x in bot5])
 
-    # Full small cap board
-    full_small = diff_table([(x["label"], x["close"], x["chg"]) for x in small])
+    # Tables
+    core_table = diff_table_rows(etfs + mag7, with_tag=True)
+    gain_table = diff_table_rows(top5, with_tag=True)
+    lose_table = diff_table_rows(bot5, with_tag=True)
 
-    crypto_block = diff_table(
-        [(x["label"], x["close"], x["chg"]) for x in crypto],
-        price_fmt=lambda v: f"{v:,.0f}"  # crypto ไม่ต้องทศนิยมเยอะ
+    macro_table = diff_table_tuple(
+        xau_row + [(c["label"], c["close"], c["chg"]) for c in crypto],
+        price_fmt=lambda v: f"{v:,.0f}" if v >= 1000 else f"{v:,.2f}"
     )
 
-    gold_block = diff_table([("XAUUSD", xau["close"], xau_chg)])
+    full_small_table = diff_table_rows(small, with_tag=False)
 
-    # ---------- Embed #1 (Dashboard) ----------
     embed1 = {
-        "title": "📊 US MARKETS — PREMIUM DASHBOARD",
-        "description": f"🕒 {now_bkk}\nStocks/ETF/XAU = Daily (Open→Close) • Crypto = 24h",
-        "color": color,
+        "title": "Market Bot — HF TERMINAL (US OPEN)",
+        "description": f"`{now_bkk}`  •  `{now_et_str}`  •  `Cycle: 30m`\n"
+                       f"**RISK** `{risk}`  |  **BREADTH** `+{pos}/-{neg}`  |  **HEAT** `{heat:+.2f}%`",
+        "color": 0x0B1220,
         "fields": [
-            embed_field("⭐ MAG 7 (sorted)", mag7_block, inline=False),
-            embed_field("📈 ETF / Indices", etf_block, inline=False),
-            embed_field("📌 Small Cap — Gainers (Top 5)", gain_block, inline=True),
-            embed_field("📌 Small Cap — Losers (Bottom 5)", lose_block, inline=True),
-            embed_field("🪙 Crypto (24h)", crypto_block, inline=False),
-            embed_field("🥇 Gold", gold_block, inline=False),
+            embed_field("CORE (QQQ/VOO + MAG7)", core_table, inline=False),
+            embed_field("SMALL CAP — GAINERS (Top 5)", gain_table, inline=True),
+            embed_field("SMALL CAP — LOSERS (Bottom 5)", lose_table, inline=True),
+            embed_field("MACRO (XAU / CRYPTO)", macro_table, inline=False),
         ],
-        "footer": {"text": "Tip: + green / - red • Clean layout • Sorted by %"},
+        "footer": {"text": "Diff colors: + green / - red • Tags: HOT/HEAT/DRAW/RISK"},
         "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
     }
 
-    # ---------- Embed #2 (Full small caps) ----------
     embed2 = {
-        "title": "🧪 SMALL CAP — FULL BOARD (sorted by %)",
-        "description": f"🕒 {now_bkk}",
-        "color": 0x1F2A44,  # น้ำเงินเข้มดูหรู
+        "title": "Market Bot — SMALL CAPS (FULL TAPE)",
+        "description": f"`{now_bkk}`  •  `{now_et_str}`  •  `Sorted by % (Daily)`",
+        "color": 0x111827,
         "fields": [
-            embed_field("All Small Caps", full_small, inline=False),
+            embed_field("TAPE", full_small_table, inline=False),
         ],
         "footer": {"text": "Full list • Sorted by % change"},
         "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
     }
 
     post_embeds([embed1, embed2])
+
 
 if __name__ == "__main__":
     main()
